@@ -31,6 +31,11 @@ button {
   cursor: pointer;
 }
 
+button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
 .workspace {
   display: grid;
   grid-template-columns: 320px 1fr;
@@ -75,4 +80,43 @@ pre {
   background: #131723;
   padding: 0.8rem;
   border-radius: 8px;
+}
+
+.binary-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  align-items: center;
+  margin-bottom: 0.8rem;
+}
+
+.binary-hint {
+  color: #9fb0e7;
+  font-size: 0.9rem;
+}
+
+.hex-wrap {
+  overflow: auto;
+  max-height: 70vh;
+  border: 1px solid #2c3552;
+  border-radius: 8px;
+}
+
+.hex-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace;
+  font-size: 0.9rem;
+}
+
+.hex-table th,
+.hex-table td {
+  text-align: left;
+  padding: 0.35rem 0.6rem;
+  border-bottom: 1px solid #2c3552;
+  white-space: pre;
+}
+
+.hex-table tbody tr:hover {
+  background: #20283b;
 }
