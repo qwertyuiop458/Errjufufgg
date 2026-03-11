@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import io
 import os
+import subprocess
+import tempfile
 import zipfile
 from pathlib import Path
 
@@ -100,8 +102,43 @@ def artifact(session_id: str, raw_path: str):
     )
 
 
+
+
 @app.get("/decompile/<session_id>/<path:raw_path>")
-def decompile_artifact(session_id: str, raw_path: str):
+def decompile(session_id: str, raw_path: str):
+    session = ARTIFACT_STORE.get(session_id)
+    if not session:
+        return jsonify({"error": "Сессия не найдена"}), 404
+
+    safe_path = sanitize_rel_path(raw_path)
+    if safe_path is None or not safe_path.lower().endswith('.class'):
+        return jsonify({"error": "Можно декомпилировать только .class файлы"}), 400
+
+    entry = session.get(safe_path)
+    if not entry:
+        return jsonify({"error": "Артефакт не найден"}), 404
+
+    class_name = safe_path[:-6].replace('/', '.')
+
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            class_file = Path(temp_dir) / safe_path
+            class_file.parent.mkdir(parents=True, exist_ok=True)
+            class_file.write_bytes(entry["data"])
+
+            cmd = ["javap", "-classpath", temp_dir, "-c", "-p", class_name]
+            proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            if proc.returncode != 0:
+                return jsonify({"error": "Не удалось декомпилировать", "details": proc.stderr.strip() or proc.stdout.strip()}), 500
+
+            return jsonify({"java_source": proc.stdout})
+    except FileNotFoundError:
+        return jsonify({"error": "Не удалось декомпилировать", "details": "Утилита javap не установлена"}), 500
+    except Exception as exc:
+        return jsonify({"error": "Не удалось декомпилировать", "details": str(exc)}), 500
+
+@app.get("/download/<session_id>/<path:raw_path>")
+def download(session_id: str, raw_path: str):
     session = ARTIFACT_STORE.get(session_id)
     if not session:
         return jsonify({"error": "Сессия не найдена"}), 404

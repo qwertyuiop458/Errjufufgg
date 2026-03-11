@@ -6,10 +6,15 @@ const previewEl = document.getElementById('preview');
 const titleEl = document.getElementById('title');
 const metaEl = document.getElementById('meta');
 const searchEl = document.getElementById('search');
+const actionsEl = document.getElementById('actions');
+const btnDecompileEl = document.getElementById('btn-decompile');
+const btnBinaryEl = document.getElementById('btn-binary');
+const btnDownloadJavaEl = document.getElementById('btn-download-java');
 
 const BINARY_PAGE_SIZE = 4096;
 
 let currentData = null;
+let decompiledText = '';
 let binaryState = null;
 
 form.addEventListener('submit', async (event) => {
@@ -41,6 +46,7 @@ function renderCategories(filter = '') {
   previewEl.innerHTML = '';
   titleEl.textContent = 'Выберите файл';
   metaEl.textContent = '';
+  actionsEl.classList.add('hidden');
 
   for (const [category, files] of Object.entries(currentData.categories)) {
     const visible = files.filter((f) => f.path.toLowerCase().includes(filter));
@@ -66,6 +72,8 @@ function renderCategories(filter = '') {
 }
 
 async function selectFile(file) {
+  decompiledText = '';
+
   const session = currentData.session_id;
   const encodedPath = file.path.split('/').map(encodeURIComponent).join('/');
   const artifactUrl = `/artifact/${session}/${encodedPath}`;
@@ -74,115 +82,105 @@ async function selectFile(file) {
   binaryState = null;
 
   titleEl.textContent = file.path;
-  metaEl.innerHTML = `Размер: ${file.size} байт<br>SHA1: ${file.sha1}<br>MIME: ${file.mime}<br><a href="${downloadUrl}">Скачать файл</a>`;
+  actionsEl.classList.remove('hidden');
+  btnDownloadJavaEl.classList.add('hidden');
+  btnBinaryEl.onclick = () => renderBinaryPreview(file, artifactUrl, downloadUrl);
+  btnDecompileEl.onclick = () => renderDecompiledPreview(file, encodedPath, downloadUrl);
+  btnDownloadJavaEl.onclick = () => downloadJava(file.path, decompiledText);
   previewEl.innerHTML = '';
 
+  if (file.path.toLowerCase().endsWith('.class')) {
+    await renderDecompiledPreview(file, encodedPath, downloadUrl);
+    return;
+  }
+
+  await renderDefaultPreview(file, artifactUrl, downloadUrl);
+}
+
+async function renderDefaultPreview(file, artifactUrl, downloadUrl) {
   if (file.mime.startsWith('image/')) {
     previewEl.innerHTML = `<img src="${artifactUrl}" alt="${file.path}">`;
+    setMeta(file, downloadUrl, 'Text');
     return;
   }
 
   if (file.mime.startsWith('audio/')) {
     previewEl.innerHTML = `<audio controls src="${artifactUrl}"></audio>`;
+    setMeta(file, downloadUrl, 'Text');
     return;
   }
 
   if (file.previewable) {
     const text = await fetch(artifactUrl).then((r) => r.text());
     previewEl.innerHTML = `<pre>${escapeHtml(text.slice(0, 20000))}</pre>`;
+    setMeta(file, downloadUrl, 'Text');
     return;
   }
 
-  if (file.path.toLowerCase().endsWith('.class')) {
-    renderClassPreviewActions(file);
-    return;
+  await renderBinaryPreview(file, artifactUrl, downloadUrl);
+}
+
+async function renderBinaryPreview(file, artifactUrl, downloadUrl) {
+  decompiledText = '';
+  btnDownloadJavaEl.classList.add('hidden');
+  const response = await fetch(artifactUrl);
+  const buffer = await response.arrayBuffer();
+  const bytes = new Uint8Array(buffer).slice(0, 2048);
+  const hexRows = [];
+  for (let i = 0; i < bytes.length; i += 16) {
+    const chunk = bytes.slice(i, i + 16);
+    const offset = i.toString(16).padStart(8, '0');
+    const hex = Array.from(chunk).map((b) => b.toString(16).padStart(2, '0')).join(' ');
+    hexRows.push(`${offset}: ${hex}`);
   }
-
-  setupBinaryPreview(file);
-  await loadBinaryChunk(0);
+  previewEl.innerHTML = `<pre>${escapeHtml(hexRows.join('\n'))}</pre>`;
+  setMeta(file, downloadUrl, 'Binary (hex)');
 }
 
-function renderClassPreviewActions(file) {
-  const actions = document.createElement('div');
-  actions.className = 'binary-actions';
-
-  const javaBtn = document.createElement('button');
-  javaBtn.textContent = 'Показать Java (декомпиляция)';
-  javaBtn.onclick = () => {
-    previewEl.innerHTML = '<p>Декомпиляция .class пока недоступна в этом интерфейсе.</p>';
-    previewEl.appendChild(actions);
-  };
-
-  const hexBtn = document.createElement('button');
-  hexBtn.textContent = 'Показать hex';
-  hexBtn.onclick = async () => {
-    setupBinaryPreview(file);
-    await loadBinaryChunk(0);
-  };
-
-  actions.appendChild(javaBtn);
-  actions.appendChild(hexBtn);
-
-  previewEl.innerHTML = '<p>Для .class приоритетен Java-просмотр. При необходимости можно открыть hex.</p>';
-  previewEl.appendChild(actions);
-}
-
-function setupBinaryPreview(file) {
-  binaryState = {
-    file,
-    offset: 0,
-    length: BINARY_PAGE_SIZE,
-  };
-}
-
-async function loadBinaryChunk(offset) {
-  if (!binaryState) return;
-
+async function renderDecompiledPreview(file, encodedPath, downloadUrl) {
   const session = currentData.session_id;
-  const encodedPath = binaryState.file.path.split('/').map(encodeURIComponent).join('/');
-  const url = `/binary/${session}/${encodedPath}?offset=${offset}&length=${binaryState.length}`;
-
-  const response = await fetch(url);
-  const data = await response.json();
+  const response = await fetch(`/decompile/${session}/${encodedPath}`);
 
   if (!response.ok) {
-    previewEl.textContent = data.error || 'Ошибка бинарного предпросмотра';
+    previewEl.innerHTML = [
+      '<p>Не удалось декомпилировать.</p>',
+      '<p>Попробуйте открыть файл как бинарный.</p>',
+      '<button id="fallback-binary" type="button">Открыть как бинарный</button>',
+    ].join('');
+    document.getElementById('fallback-binary').onclick = () => {
+      const artifactUrl = `/artifact/${session}/${encodedPath}`;
+      renderBinaryPreview(file, artifactUrl, downloadUrl);
+    };
+    btnDownloadJavaEl.classList.add('hidden');
+    setMeta(file, downloadUrl, 'Binary (hex)');
     return;
   }
 
-  binaryState.offset = data.offset;
-  renderHexTable(data);
+  const payload = await response.json();
+  decompiledText = payload.java_source || '';
+  previewEl.innerHTML = `<pre>${escapeHtml(decompiledText)}</pre>`;
+  btnDownloadJavaEl.classList.remove('hidden');
+  setMeta(file, downloadUrl, 'Decompiled Java');
 }
 
-function renderHexTable(data) {
-  const lines = data.hex_lines.map((hexLine, idx) => {
-    const lineOffset = data.offset + idx * 16;
-    const addr = lineOffset.toString(16).padStart(8, '0');
-    const ascii = data.ascii_lines[idx] || '';
-    return `<tr><td>${addr}</td><td>${escapeHtml(hexLine)}</td><td>${escapeHtml(ascii)}</td></tr>`;
-  }).join('');
+function setMeta(file, downloadUrl, previewMode) {
+  metaEl.innerHTML = `Размер: ${file.size} байт<br>SHA1: ${file.sha1}<br>MIME: ${file.mime}<br>Preview: ${previewMode}<br><a href="${downloadUrl}">Скачать файл</a>`;
+}
 
-  const prevDisabled = data.offset === 0 ? 'disabled' : '';
-  const nextDisabled = data.offset + data.length >= data.total_size ? 'disabled' : '';
-
-  previewEl.innerHTML = `
-    <div class="binary-actions">
-      <button id="prev-block" ${prevDisabled}>Предыдущий блок</button>
-      <button id="next-block" ${nextDisabled}>Следующий блок</button>
-      <span class="binary-hint">offset ${data.offset}..${data.offset + data.length} из ${data.total_size}</span>
-    </div>
-    <div class="hex-wrap">
-      <table class="hex-table">
-        <thead><tr><th>Адрес</th><th>HEX</th><th>ASCII</th></tr></thead>
-        <tbody>${lines}</tbody>
-      </table>
-    </div>
-  `;
-
-  const prevBtn = document.getElementById('prev-block');
-  const nextBtn = document.getElementById('next-block');
-  prevBtn.onclick = () => loadBinaryChunk(Math.max(0, data.offset - binaryState.length));
-  nextBtn.onclick = () => loadBinaryChunk(data.offset + data.length);
+function downloadJava(path, source) {
+  if (!source) {
+    return;
+  }
+  const baseName = path.split('/').pop().replace(/\.class$/i, '.java');
+  const blob = new Blob([source], { type: 'text/x-java-source;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = baseName;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
 }
 
 function escapeHtml(value) {

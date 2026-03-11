@@ -82,41 +82,21 @@ pre {
   border-radius: 8px;
 }
 
-.binary-actions {
+#actions {
   display: flex;
-  flex-wrap: wrap;
   gap: 0.6rem;
-  align-items: center;
   margin-bottom: 0.8rem;
+  flex-wrap: wrap;
 }
 
-.binary-hint {
-  color: #9fb0e7;
-  font-size: 0.9rem;
+#actions.hidden {
+  display: none;
 }
 
-.hex-wrap {
-  overflow: auto;
-  max-height: 70vh;
-  border: 1px solid #2c3552;
-  border-radius: 8px;
+#actions button {
+  background: #2c3f7f;
 }
 
-.hex-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace;
-  font-size: 0.9rem;
-}
-
-.hex-table th,
-.hex-table td {
-  text-align: left;
-  padding: 0.35rem 0.6rem;
-  border-bottom: 1px solid #2c3552;
-  white-space: pre;
-}
-
-.hex-table tbody tr:hover {
-  background: #20283b;
+#fallback-binary {
+  margin-top: 0.6rem;
 }
