@@ -11,8 +11,11 @@ const btnDecompileEl = document.getElementById('btn-decompile');
 const btnBinaryEl = document.getElementById('btn-binary');
 const btnDownloadJavaEl = document.getElementById('btn-download-java');
 
+const BINARY_PAGE_SIZE = 4096;
+
 let currentData = null;
 let decompiledText = '';
+let binaryState = null;
 
 form.addEventListener('submit', async (event) => {
   event.preventDefault();
@@ -75,6 +78,8 @@ async function selectFile(file) {
   const encodedPath = file.path.split('/').map(encodeURIComponent).join('/');
   const artifactUrl = `/artifact/${session}/${encodedPath}`;
   const downloadUrl = `/download/${session}/${encodedPath}`;
+
+  binaryState = null;
 
   titleEl.textContent = file.path;
   actionsEl.classList.remove('hidden');
