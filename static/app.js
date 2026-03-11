@@ -121,6 +121,96 @@ function formatHexData(uint8) {
   };
 }
 
+function setupAudioControls(container, src, hintDuration = null) {
+  const audio = container.querySelector('audio');
+  const playBtn = container.querySelector('.play-btn');
+  const stopBtn = container.querySelector('.stop-btn');
+  const volume = container.querySelector('.volume-slider');
+  const progress = container.querySelector('.progress-slider');
+  const loopBox = container.querySelector('.loop-box');
+  const timeEl = container.querySelector('.time-label');
+
+  audio.src = src;
+  audio.preload = 'metadata';
+
+  const fmt = (t) => {
+    if (!Number.isFinite(t) || t < 0) return '--:--';
+    const m = Math.floor(t / 60);
+    const s = Math.floor(t % 60);
+    return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+  };
+
+  const updateTime = () => {
+    const total = Number.isFinite(audio.duration) ? audio.duration : hintDuration;
+    timeEl.textContent = `${fmt(audio.currentTime)} / ${fmt(total)}`;
+    if (Number.isFinite(audio.duration) && audio.duration > 0) {
+      progress.value = String(Math.round((audio.currentTime / audio.duration) * 1000));
+    }
+  };
+
+  playBtn.onclick = async () => {
+    try {
+      if (audio.paused) {
+        await audio.play();
+        playBtn.textContent = '⏸ Пауза';
+      } else {
+        audio.pause();
+        playBtn.textContent = '▶️ Play';
+      }
+    } catch (error) {
+      timeEl.textContent = `Ошибка воспроизведения: ${error}`;
+    }
+  };
+
+  stopBtn.onclick = () => {
+    audio.pause();
+    audio.currentTime = 0;
+    playBtn.textContent = '▶️ Play';
+    updateTime();
+  };
+
+  volume.oninput = () => {
+    audio.volume = Number(volume.value);
+  };
+
+  progress.oninput = () => {
+    if (Number.isFinite(audio.duration)) {
+      audio.currentTime = (Number(progress.value) / 1000) * audio.duration;
+    }
+  };
+
+  loopBox.onchange = () => {
+    audio.loop = loopBox.checked;
+  };
+
+  audio.addEventListener('timeupdate', updateTime);
+  audio.addEventListener('loadedmetadata', updateTime);
+  audio.addEventListener('ended', () => {
+    playBtn.textContent = '▶️ Play';
+  });
+
+  updateTime();
+}
+
+function renderPlayerHost(resultPanel, src, format, durationSeconds = null) {
+  resultPanel.innerHTML = `
+    <div class="audio-card">
+      <p><strong>Формат:</strong> ${escapeHtml(String(format).toUpperCase())} ${durationSeconds ? `• ${durationSeconds} сек` : ''}</p>
+      <audio controls></audio>
+      <div class="actions-row">
+        <button type="button" class="action-btn play-btn">▶️ Play</button>
+        <button type="button" class="action-btn secondary stop-btn">⏹ Stop</button>
+        <label>Volume <input class="volume-slider" type="range" min="0" max="1" step="0.01" value="1"></label>
+        <label>Progress <input class="progress-slider" type="range" min="0" max="1000" step="1" value="0"></label>
+        <label><input class="loop-box" type="checkbox"> Loop</label>
+      </div>
+      <p class="time-label">00:00 / --:--</p>
+    </div>
+  `;
+
+  setupAudioControls(resultPanel.querySelector('.audio-card'), src, durationSeconds);
+}
+
 async function selectFile(file, itemNode) {
   clearSelectedFile();
   if (itemNode) itemNode.classList.add('active');
@@ -130,6 +220,7 @@ async function selectFile(file, itemNode) {
   const artifactUrl = `/artifact/${session}/${encodedPath}`;
   const downloadUrl = `/download/${session}/${encodedPath}`;
   const isClassFile = file.path.toLowerCase().endsWith('.class');
+  const knownAudio = Boolean(file.audio_detected || file.mime.startsWith('audio/'));
 
   titleEl.textContent = file.path;
   metaEl.innerHTML = `
@@ -138,7 +229,7 @@ async function selectFile(file, itemNode) {
       <span>SHA1:</span><strong class="sha-cell">${file.sha1}</strong>
       <span>MIME:</span><strong>${file.mime}</strong>
     </div>
-    <a class="download-link" href="${downloadUrl}">Скачать файл</a>
+    <a class="download-link" href="${downloadUrl}">💾 Скачать</a>
   `;
   previewEl.innerHTML = '';
 
@@ -147,12 +238,7 @@ async function selectFile(file, itemNode) {
     return;
   }
 
-  if (file.mime.startsWith('audio/')) {
-    previewEl.innerHTML = `<audio controls src="${artifactUrl}"></audio>`;
-    return;
-  }
-
-  if (file.previewable && !isClassFile) {
+  if (file.previewable && !isClassFile && !knownAudio) {
     const text = await fetch(artifactUrl).then((r) => r.text());
     previewEl.innerHTML = `<pre class="code-box">${escapeHtml(text.slice(0, 50000))}</pre>`;
     return;
@@ -163,28 +249,62 @@ async function selectFile(file, itemNode) {
   const hexData = formatHexData(view);
 
   previewEl.innerHTML = `
-    <div class="actions-row">
-      <button id="decompile-btn" class="action-btn" type="button">Декомпилировать .class</button>
-      <button id="hex-cycle-btn" class="action-btn" type="button">Показать HEX</button>
-    </div>
+    <div class="actions-row" id="file-actions"></div>
     <div id="preview-message"></div>
     <div id="result-panel"></div>
   `;
 
+  const actions = document.getElementById('file-actions');
   const resultPanel = document.getElementById('result-panel');
   const messageEl = document.getElementById('preview-message');
-  const decompileBtn = document.getElementById('decompile-btn');
-  const hexBtn = document.getElementById('hex-cycle-btn');
 
-  let javaSource = '';
-  let javaLoaded = false;
-  let hexState = 0; // 0 show, 1 copy hex, 2 copy ascii
+  const hexBtn = document.createElement('button');
+  hexBtn.className = 'action-btn';
+  hexBtn.type = 'button';
+  hexBtn.textContent = 'Показать HEX';
+  setButtonColor(hexBtn, 'gray');
+  actions.appendChild(hexBtn);
 
-  if (!isClassFile) {
-    decompileBtn.style.display = 'none';
-  } else {
-    decompileBtn.style.display = 'inline-block';
+  let hexState = 0;
+  hexBtn.onclick = async () => {
+    try {
+      if (hexState === 0) {
+        resultPanel.innerHTML = `<pre class="hex-box">${escapeHtml(hexData.pretty)}</pre>`;
+        hexBtn.textContent = '📋 Копировать HEX';
+        setButtonColor(hexBtn, 'orange');
+        hexState = 1;
+        return;
+      }
+      if (hexState === 1) {
+        await copyToClipboard(hexData.hexOnly);
+        messageEl.innerHTML = '<p>✅ HEX скопирован!</p>';
+        hexBtn.textContent = '📋 Копировать ASCII';
+        setButtonColor(hexBtn, 'blue');
+        hexState = 2;
+        setTimeout(() => { messageEl.innerHTML = ''; }, 1500);
+        return;
+      }
+      await copyToClipboard(hexData.asciiOnly);
+      messageEl.innerHTML = '<p>✅ ASCII скопирован!</p>';
+      hexBtn.textContent = 'Показать HEX';
+      setButtonColor(hexBtn, 'gray');
+      hexState = 0;
+      setTimeout(() => { messageEl.innerHTML = ''; }, 1500);
+    } catch (error) {
+      messageEl.innerHTML = `<p class="error">Ошибка копирования: ${escapeHtml(String(error))}</p>`;
+    }
+  };
+
+  if (isClassFile) {
+    const decompileBtn = document.createElement('button');
+    decompileBtn.className = 'action-btn';
+    decompileBtn.type = 'button';
+    decompileBtn.textContent = 'Декомпилировать .class';
     setButtonColor(decompileBtn, 'gray');
+    actions.prepend(decompileBtn);
+
+    let javaSource = '';
+    let javaLoaded = false;
 
     decompileBtn.onclick = async () => {
       if (!javaLoaded) {
@@ -223,50 +343,71 @@ async function selectFile(file, itemNode) {
 
       try {
         await copyToClipboard(javaSource);
-        const prev = decompileBtn.textContent;
         decompileBtn.textContent = '✅ Скопировано!';
         setTimeout(() => {
-          decompileBtn.textContent = prev || '📋 Копировать Java код';
+          decompileBtn.textContent = '📋 Копировать Java код';
         }, 1500);
       } catch (error) {
         resultPanel.innerHTML = `<p class="error">Ошибка копирования: ${escapeHtml(String(error))}</p>`;
       }
     };
+
+    return;
   }
 
-  setButtonColor(hexBtn, 'gray');
-  hexBtn.onclick = async () => {
+  if (knownAudio) {
+    const listenBtn = document.createElement('button');
+    listenBtn.className = 'action-btn';
+    listenBtn.type = 'button';
+    listenBtn.textContent = '▶️ Слушать';
+    actions.prepend(listenBtn);
+
+    listenBtn.onclick = async () => {
+      const probeResp = await fetch(`/audio_probe/${session}/${encodedPath}`).then((r) => r.json());
+      if (!probeResp.found) {
+        messageEl.innerHTML = '<p class="error">Музыкальная сигнатура не найдена</p>';
+        return;
+      }
+
+      messageEl.innerHTML = `<p>Найден ${escapeHtml(probeResp.format.toUpperCase())} @ ${probeResp.offset_hex}</p>`;
+      const streamUrl = `/audio_stream/${session}/${encodedPath}?offset=${probeResp.offset}`;
+      renderPlayerHost(resultPanel, streamUrl, probeResp.format, probeResp.duration_seconds);
+    };
+
+    return;
+  }
+
+  const findAudioBtn = document.createElement('button');
+  findAudioBtn.className = 'action-btn secondary';
+  findAudioBtn.type = 'button';
+  findAudioBtn.textContent = '🔍 Найти музыку';
+  actions.prepend(findAudioBtn);
+
+  findAudioBtn.onclick = async () => {
     try {
-      if (hexState === 0) {
-        resultPanel.innerHTML = `<pre class="hex-box">${escapeHtml(hexData.pretty)}</pre>`;
-        hexBtn.textContent = '📋 Копировать HEX';
-        setButtonColor(hexBtn, 'orange');
-        hexState = 1;
+      const probeResp = await fetch(`/audio_probe/${session}/${encodedPath}`).then((r) => r.json());
+      if (!probeResp.found) {
+        messageEl.innerHTML = '<p>Музыкальные сигнатуры не найдены в первых 1024 байтах.</p>';
         return;
       }
 
-      if (hexState === 1) {
-        await copyToClipboard(hexData.hexOnly);
-        messageEl.innerHTML = '<p>✅ HEX скопирован!</p>';
-        hexBtn.textContent = '📋 Копировать ASCII';
-        setButtonColor(hexBtn, 'blue');
-        hexState = 2;
-        setTimeout(() => {
-          messageEl.innerHTML = '';
-        }, 1500);
-        return;
+      messageEl.innerHTML = `<p>Найден ${escapeHtml(probeResp.format.toUpperCase())} @ ${probeResp.offset_hex}</p>`;
+
+      const listenBtn = document.createElement('button');
+      listenBtn.className = 'action-btn';
+      listenBtn.type = 'button';
+      listenBtn.textContent = '▶️ Слушать';
+      if (!actions.querySelector('.listen-dynamic')) {
+        listenBtn.classList.add('listen-dynamic');
+        actions.insertBefore(listenBtn, actions.firstChild);
       }
 
-      await copyToClipboard(hexData.asciiOnly);
-      messageEl.innerHTML = '<p>✅ ASCII скопирован!</p>';
-      hexBtn.textContent = 'Показать HEX';
-      setButtonColor(hexBtn, 'gray');
-      hexState = 0;
-      setTimeout(() => {
-        messageEl.innerHTML = '';
-      }, 1500);
+      listenBtn.onclick = () => {
+        const streamUrl = `/audio_stream/${session}/${encodedPath}?offset=${probeResp.offset}`;
+        renderPlayerHost(resultPanel, streamUrl, probeResp.format, probeResp.duration_seconds);
+      };
     } catch (error) {
-      messageEl.innerHTML = `<p class="error">Ошибка копирования: ${escapeHtml(String(error))}</p>`;
+      messageEl.innerHTML = `<p class="error">Ошибка аудиоанализа: ${escapeHtml(String(error))}</p>`;
     }
   };
 }

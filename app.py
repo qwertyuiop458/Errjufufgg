@@ -14,6 +14,7 @@ from flask import Flask, jsonify, render_template, request, send_file
 from parser import (
     ARTIFACT_STORE,
     analyze_archive,
+    detect_audio_signature,
     parse_jad,
     sanitize_rel_path,
     summarize_jad,
@@ -69,6 +70,23 @@ def ensure_java_and_cfr(force: bool = False) -> tuple[bool, str | None]:
     JAVA_SETUP_STATE.update({"checked": True, "ok": True, "error": None})
     return True, None
 
+
+
+
+def estimate_duration_seconds(data: bytes, fmt: str, offset: int = 0) -> float | None:
+    if fmt != "wav":
+        return None
+    if offset + 44 > len(data):
+        return None
+    chunk = data[offset:]
+    if chunk[:4] != b"RIFF" or chunk[8:12] != b"WAVE":
+        return None
+
+    byte_rate = int.from_bytes(chunk[28:32], "little", signed=False)
+    data_size = int.from_bytes(chunk[40:44], "little", signed=False)
+    if byte_rate <= 0:
+        return None
+    return round(data_size / byte_rate, 2)
 
 def build_hex_preview(data: bytes, limit: int = 256) -> str:
     chunk = data[:limit]
@@ -138,6 +156,80 @@ def analyze():
     except zipfile.BadZipFile:
         return jsonify({"error": "Файл JAR повреждён или не является ZIP архивом."}), 400
 
+
+
+
+@app.get("/audio_probe/<session_id>/<path:raw_path>")
+def audio_probe(session_id: str, raw_path: str):
+    session = ARTIFACT_STORE.get(session_id)
+    if not session:
+        return jsonify({"error": "Сессия не найдена"}), 404
+
+    safe_path = sanitize_rel_path(raw_path)
+    if safe_path is None:
+        return jsonify({"error": "Недопустимый путь"}), 400
+
+    entry = session.get(safe_path)
+    if not entry:
+        return jsonify({"error": "Артефакт не найден"}), 404
+
+    data = entry["data"]
+    if not isinstance(data, bytes):
+        return jsonify({"error": "Некорректные данные артефакта"}), 500
+
+    probe = detect_audio_signature(data, safe_path)
+    if not probe:
+        return jsonify({"found": False, "error": "Музыкальная сигнатура не найдена"}), 200
+
+    fmt = str(probe["format"])
+    offset = int(probe["offset"])
+    duration = estimate_duration_seconds(data, fmt, offset)
+
+    return jsonify(
+        {
+            "found": True,
+            "format": fmt,
+            "offset": offset,
+            "offset_hex": f"0x{offset:08x}",
+            "mime": str(probe["mime"]),
+            "duration_seconds": duration,
+        }
+    )
+
+
+@app.get("/audio_stream/<session_id>/<path:raw_path>")
+def audio_stream(session_id: str, raw_path: str):
+    session = ARTIFACT_STORE.get(session_id)
+    if not session:
+        return jsonify({"error": "Сессия не найдена"}), 404
+
+    safe_path = sanitize_rel_path(raw_path)
+    if safe_path is None:
+        return jsonify({"error": "Недопустимый путь"}), 400
+
+    entry = session.get(safe_path)
+    if not entry:
+        return jsonify({"error": "Артефакт не найден"}), 404
+
+    data = entry["data"]
+    if not isinstance(data, bytes):
+        return jsonify({"error": "Некорректные данные артефакта"}), 500
+
+    probe = detect_audio_signature(data, safe_path)
+    if not probe:
+        return jsonify({"error": "Музыкальная сигнатура не найдена"}), 400
+
+    offset = int(request.args.get("offset", probe["offset"]))
+    if offset < 0 or offset >= len(data):
+        return jsonify({"error": "Недопустимый offset"}), 400
+
+    mime = str(probe["mime"])
+    return send_file(
+        io.BytesIO(data[offset:]),
+        mimetype=mime,
+        as_attachment=False,
+        download_name=os.path.basename(safe_path),
+    )
 
 @app.get("/decompile/<session_id>/<path:raw_path>")
 def decompile(session_id: str, raw_path: str):
