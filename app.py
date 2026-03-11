@@ -11,6 +11,13 @@ from pathlib import Path
 
 from flask import Flask, jsonify, render_template, request, send_file
 
+from decompiler import (
+    DecompilerError,
+    DecompilerNotConfiguredError,
+    DecompilerTimeoutError,
+    decompile_class_bytes,
+)
+
 from parser import (
     ARTIFACT_STORE,
     analyze_archive,
@@ -62,6 +69,8 @@ def build_hex_preview(data: bytes, limit: int = 256) -> str:
         ascii_values = "".join(chr(b) if 32 <= b <= 126 else "." for b in part)
         lines.append(f"{i:08x}  {hex_values:<47}  {ascii_values}")
     return "\n".join(lines)
+HEX_LINE_WIDTH = 16
+MAX_BINARY_CHUNK = 16 * 1024
 
 
 @app.route("/")
@@ -136,72 +145,24 @@ def decompile(session_id: str, raw_path: str):
     if not entry:
         return jsonify({"error": "Артефакт не найден"}), 404
 
-    data = entry["data"]
-    if not isinstance(data, bytes):
-        return jsonify({"error": "Некорректные данные артефакта"}), 500
-
-    if not safe_path.lower().endswith(".class"):
-        return jsonify({"error": "Декомпиляция поддерживается только для .class"}), 400
-
-    ok, setup_error = ensure_java_and_cfr()
-    if not ok:
-        return jsonify({"error": setup_error, "hex_preview": build_hex_preview(data)})
+    class_name = safe_path[:-6].replace('/', '.')
 
     try:
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_dir = Path(tmp)
-            class_path = tmp_dir / Path(safe_path).name
-            class_path.write_bytes(data)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            class_file = Path(temp_dir) / safe_path
+            class_file.parent.mkdir(parents=True, exist_ok=True)
+            class_file.write_bytes(entry["data"])
 
-            output_dir = tmp_dir / "out"
-            output_dir.mkdir(parents=True, exist_ok=True)
+            cmd = ["javap", "-classpath", temp_dir, "-c", "-p", class_name]
+            proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            if proc.returncode != 0:
+                return jsonify({"error": "Не удалось декомпилировать", "details": proc.stderr.strip() or proc.stdout.strip()}), 500
 
-            process = subprocess.run(
-                [
-                    "java",
-                    "-jar",
-                    str(CFR_PATH),
-                    str(class_path),
-                    "--outputdir",
-                    str(output_dir),
-                ],
-                capture_output=True,
-                text=True,
-                timeout=45,
-            )
-
-            java_files = list(output_dir.rglob("*.java"))
-            if process.returncode != 0 or not java_files:
-                err = (process.stderr or process.stdout or "Не удалось декомпилировать class файл").strip()
-                return jsonify({"error": err, "hex_preview": build_hex_preview(data)})
-
-            java_source = java_files[0].read_text(encoding="utf-8", errors="ignore")
-            return jsonify({"java_source": java_source, "hex_preview": None, "error": None})
-    except Exception as exc:  # noqa: BLE001
-        return jsonify({"error": f"Ошибка декомпиляции: {exc}", "hex_preview": build_hex_preview(data)})
-
-
-@app.get("/artifact/<session_id>/<path:raw_path>")
-def artifact(session_id: str, raw_path: str):
-    session = ARTIFACT_STORE.get(session_id)
-    if not session:
-        return jsonify({"error": "Сессия не найдена"}), 404
-
-    safe_path = sanitize_rel_path(raw_path)
-    if safe_path is None:
-        return jsonify({"error": "Недопустимый путь"}), 400
-
-    entry = session.get(safe_path)
-    if not entry:
-        return jsonify({"error": "Артефакт не найден"}), 404
-
-    return send_file(
-        io.BytesIO(entry["data"]),
-        mimetype=entry["mime"],
-        as_attachment=False,
-        download_name=os.path.basename(safe_path),
-    )
-
+            return jsonify({"java_source": proc.stdout})
+    except FileNotFoundError:
+        return jsonify({"error": "Не удалось декомпилировать", "details": "Утилита javap не установлена"}), 500
+    except Exception as exc:
+        return jsonify({"error": "Не удалось декомпилировать", "details": str(exc)}), 500
 
 @app.get("/download/<session_id>/<path:raw_path>")
 def download(session_id: str, raw_path: str):
@@ -213,9 +174,34 @@ def download(session_id: str, raw_path: str):
     if safe_path is None:
         return jsonify({"error": "Недопустимый путь"}), 400
 
+    if not safe_path.lower().endswith(".class"):
+        return jsonify({"error": "Декомпиляция доступна только для .class файлов"}), 400
+
     entry = session.get(safe_path)
     if not entry:
         return jsonify({"error": "Артефакт не найден"}), 404
+
+    return send_file(
+        io.BytesIO(entry["data"]),
+        mimetype=entry["mime"],
+        as_attachment=False,
+    try:
+        java_code = decompile_class_bytes(entry["data"], safe_path)
+    except DecompilerNotConfiguredError as exc:
+        return jsonify({"error": str(exc)}), 503
+    except DecompilerTimeoutError as exc:
+        return jsonify({"error": str(exc)}), 504
+    except DecompilerError as exc:
+        return jsonify({"error": str(exc)}), 422
+
+    return app.response_class(java_code, mimetype="text/plain; charset=utf-8")
+
+
+@app.get("/download/<session_id>/<path:raw_path>")
+def download(session_id: str, raw_path: str):
+    safe_path, entry, error = get_artifact_entry(session_id, raw_path)
+    if error:
+        return error
 
     return send_file(
         io.BytesIO(entry["data"]),
@@ -225,6 +211,61 @@ def download(session_id: str, raw_path: str):
     )
 
 
+@app.get("/binary/<session_id>/<path:raw_path>")
+def binary_preview(session_id: str, raw_path: str):
+    _, entry, error = get_artifact_entry(session_id, raw_path)
+    if error:
+        return error
+
+    offset = request.args.get("offset", default=0, type=int)
+    length = request.args.get("length", default=4096, type=int)
+
+    if offset is None or offset < 0:
+        return jsonify({"error": "offset должен быть >= 0"}), 400
+    if length is None or length <= 0:
+        return jsonify({"error": "length должен быть > 0"}), 400
+
+    length = min(length, MAX_BINARY_CHUNK)
+
+    data = entry["data"]
+    total_size = len(data)
+    if offset > total_size:
+        return jsonify({"error": "offset выходит за пределы файла"}), 400
+
+    chunk = data[offset : offset + length]
+    hex_lines: list[str] = []
+    ascii_lines: list[str] = []
+    for index in range(0, len(chunk), HEX_LINE_WIDTH):
+        line = chunk[index : index + HEX_LINE_WIDTH]
+        hex_lines.append(" ".join(f"{byte:02x}" for byte in line))
+        ascii_lines.append("".join(chr(byte) if 32 <= byte <= 126 else "." for byte in line))
+
+    return jsonify(
+        {
+            "offset": offset,
+            "length": len(chunk),
+            "total_size": total_size,
+            "hex_lines": hex_lines,
+            "ascii_lines": ascii_lines,
+        }
+    )
+
+
+def get_artifact_entry(session_id: str, raw_path: str):
+    session = ARTIFACT_STORE.get(session_id)
+    if not session:
+        return None, None, (jsonify({"error": "Сессия не найдена"}), 404)
+
+    safe_path = sanitize_rel_path(raw_path)
+    if safe_path is None:
+        return None, None, (jsonify({"error": "Недопустимый путь"}), 400)
+
+    entry = session.get(safe_path)
+    if not entry:
+        return None, None, (jsonify({"error": "Артефакт не найден"}), 404)
+
+    return safe_path, entry, None
+
+
 if __name__ == "__main__":
-    ensure_java_and_cfr()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8000")), debug=True)
