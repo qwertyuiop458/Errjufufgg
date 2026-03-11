@@ -24,6 +24,9 @@ from parser import (
 
 app = Flask(__name__)
 
+HEX_LINE_WIDTH = 16
+MAX_BINARY_CHUNK = 16 * 1024
+
 
 @app.route("/")
 def index():
@@ -85,17 +88,9 @@ def analyze():
 
 @app.get("/artifact/<session_id>/<path:raw_path>")
 def artifact(session_id: str, raw_path: str):
-    session = ARTIFACT_STORE.get(session_id)
-    if not session:
-        return jsonify({"error": "Сессия не найдена"}), 404
-
-    safe_path = sanitize_rel_path(raw_path)
-    if safe_path is None:
-        return jsonify({"error": "Недопустимый путь"}), 400
-
-    entry = session.get(safe_path)
-    if not entry:
-        return jsonify({"error": "Артефакт не найден"}), 404
+    safe_path, entry, error = get_artifact_entry(session_id, raw_path)
+    if error:
+        return error
 
     return send_file(
         io.BytesIO(entry["data"]),
@@ -136,17 +131,9 @@ def decompile_artifact(session_id: str, raw_path: str):
 
 @app.get("/download/<session_id>/<path:raw_path>")
 def download(session_id: str, raw_path: str):
-    session = ARTIFACT_STORE.get(session_id)
-    if not session:
-        return jsonify({"error": "Сессия не найдена"}), 404
-
-    safe_path = sanitize_rel_path(raw_path)
-    if safe_path is None:
-        return jsonify({"error": "Недопустимый путь"}), 400
-
-    entry = session.get(safe_path)
-    if not entry:
-        return jsonify({"error": "Артефакт не найден"}), 404
+    safe_path, entry, error = get_artifact_entry(session_id, raw_path)
+    if error:
+        return error
 
     return send_file(
         io.BytesIO(entry["data"]),
@@ -154,6 +141,62 @@ def download(session_id: str, raw_path: str):
         as_attachment=True,
         download_name=os.path.basename(safe_path),
     )
+
+
+@app.get("/binary/<session_id>/<path:raw_path>")
+def binary_preview(session_id: str, raw_path: str):
+    _, entry, error = get_artifact_entry(session_id, raw_path)
+    if error:
+        return error
+
+    offset = request.args.get("offset", default=0, type=int)
+    length = request.args.get("length", default=4096, type=int)
+
+    if offset is None or offset < 0:
+        return jsonify({"error": "offset должен быть >= 0"}), 400
+    if length is None or length <= 0:
+        return jsonify({"error": "length должен быть > 0"}), 400
+
+    length = min(length, MAX_BINARY_CHUNK)
+
+    data = entry["data"]
+    total_size = len(data)
+    if offset > total_size:
+        return jsonify({"error": "offset выходит за пределы файла"}), 400
+
+    chunk = data[offset : offset + length]
+    hex_lines: list[str] = []
+    ascii_lines: list[str] = []
+    for index in range(0, len(chunk), HEX_LINE_WIDTH):
+        line = chunk[index : index + HEX_LINE_WIDTH]
+        hex_lines.append(" ".join(f"{byte:02x}" for byte in line))
+        ascii_lines.append("".join(chr(byte) if 32 <= byte <= 126 else "." for byte in line))
+
+    return jsonify(
+        {
+            "offset": offset,
+            "length": len(chunk),
+            "total_size": total_size,
+            "hex_lines": hex_lines,
+            "ascii_lines": ascii_lines,
+        }
+    )
+
+
+def get_artifact_entry(session_id: str, raw_path: str):
+    session = ARTIFACT_STORE.get(session_id)
+    if not session:
+        return None, None, (jsonify({"error": "Сессия не найдена"}), 404)
+
+    safe_path = sanitize_rel_path(raw_path)
+    if safe_path is None:
+        return None, None, (jsonify({"error": "Недопустимый путь"}), 400)
+
+    entry = session.get(safe_path)
+    if not entry:
+        return None, None, (jsonify({"error": "Артефакт не найден"}), 404)
+
+    return safe_path, entry, None
 
 
 if __name__ == "__main__":
