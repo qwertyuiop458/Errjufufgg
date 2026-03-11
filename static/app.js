@@ -72,6 +72,55 @@ function clearSelectedFile() {
   document.querySelectorAll('.file-item.active').forEach((node) => node.classList.remove('active'));
 }
 
+function setButtonColor(btn, mode) {
+  const palette = {
+    gray: '#5f6578',
+    orange: '#d9822b',
+    blue: '#2d6cdf',
+    green: '#2ea44f',
+  };
+  btn.style.background = palette[mode] || palette.gray;
+}
+
+async function copyToClipboard(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+
+  const area = document.createElement('textarea');
+  area.value = text;
+  area.setAttribute('readonly', '');
+  area.style.position = 'fixed';
+  area.style.left = '-9999px';
+  document.body.appendChild(area);
+  area.select();
+  document.execCommand('copy');
+  document.body.removeChild(area);
+}
+
+function formatHexData(uint8) {
+  const lines = [];
+  const pureHex = [];
+  const asciiOnly = [];
+
+  for (let i = 0; i < uint8.length; i += 16) {
+    const chunk = Array.from(uint8.slice(i, i + 16));
+    const hex = chunk.map((b) => b.toString(16).padStart(2, '0'));
+    const ascii = chunk.map((b) => (b >= 32 && b <= 126 ? String.fromCharCode(b) : '.'));
+
+    lines.push(`${i.toString(16).padStart(8, '0')}: ${hex.join(' ').padEnd(47, ' ')}  ${ascii.join('')}`);
+    pureHex.push(...hex);
+    asciiOnly.push(...ascii);
+  }
+
+  return {
+    pretty: lines.join('\n'),
+    hexOnly: pureHex.join(' '),
+    asciiOnly: asciiOnly.join(''),
+  };
+}
+
 async function selectFile(file, itemNode) {
   clearSelectedFile();
   if (itemNode) itemNode.classList.add('active');
@@ -80,6 +129,7 @@ async function selectFile(file, itemNode) {
   const encodedPath = file.path.split('/').map(encodeURIComponent).join('/');
   const artifactUrl = `/artifact/${session}/${encodedPath}`;
   const downloadUrl = `/download/${session}/${encodedPath}`;
+  const isClassFile = file.path.toLowerCase().endsWith('.class');
 
   titleEl.textContent = file.path;
   metaEl.innerHTML = `
@@ -102,67 +152,123 @@ async function selectFile(file, itemNode) {
     return;
   }
 
-  if (file.path.toLowerCase().endsWith('.class')) {
-    previewEl.innerHTML = `
-      <div class="actions-row">
-        <button id="decompile-btn" class="action-btn" type="button">Декомпилировать .class</button>
-        <button id="show-hex-btn" class="action-btn secondary" type="button">Показать HEX</button>
-      </div>
-      <div id="decompile-result"></div>
-    `;
-
-    document.getElementById('decompile-btn').onclick = () => decompileClass(session, encodedPath);
-    document.getElementById('show-hex-btn').onclick = async () => {
-      const buf = await fetch(artifactUrl).then((r) => r.arrayBuffer());
-      document.getElementById('decompile-result').innerHTML = `<pre class="hex-box">${escapeHtml(formatHex(new Uint8Array(buf).slice(0, 1024)))}</pre>`;
-    };
-
-    await decompileClass(session, encodedPath);
-    return;
-  }
-
-  if (file.previewable) {
+  if (file.previewable && !isClassFile) {
     const text = await fetch(artifactUrl).then((r) => r.text());
     previewEl.innerHTML = `<pre class="code-box">${escapeHtml(text.slice(0, 50000))}</pre>`;
     return;
   }
 
   const bin = await fetch(artifactUrl).then((r) => r.arrayBuffer());
-  const view = new Uint8Array(bin).slice(0, 1024);
-  previewEl.innerHTML = `<pre class="hex-box">${escapeHtml(formatHex(view))}</pre>`;
-}
+  const view = new Uint8Array(bin).slice(0, 2048);
+  const hexData = formatHexData(view);
 
-async function decompileClass(session, encodedPath) {
-  const resultEl = document.getElementById('decompile-result');
-  resultEl.innerHTML = '<p>Декомпиляция...</p>';
+  previewEl.innerHTML = `
+    <div class="actions-row">
+      <button id="decompile-btn" class="action-btn" type="button">Декомпилировать .class</button>
+      <button id="hex-cycle-btn" class="action-btn" type="button">Показать HEX</button>
+    </div>
+    <div id="preview-message"></div>
+    <div id="result-panel"></div>
+  `;
 
-  try {
-    const response = await fetch(`/decompile/${session}/${encodedPath}`);
-    const data = await response.json();
+  const resultPanel = document.getElementById('result-panel');
+  const messageEl = document.getElementById('preview-message');
+  const decompileBtn = document.getElementById('decompile-btn');
+  const hexBtn = document.getElementById('hex-cycle-btn');
 
-    if (data.java_source) {
-      resultEl.innerHTML = `<pre class="code-box">${escapeHtml(data.java_source)}</pre>`;
-      return;
-    }
+  let javaSource = '';
+  let javaLoaded = false;
+  let hexState = 0; // 0 show, 1 copy hex, 2 copy ascii
 
-    resultEl.innerHTML = `<p class="error">${escapeHtml(data.error || 'Не удалось декомпилировать')}</p>`;
-    if (data.hex_preview) {
-      resultEl.innerHTML += `<pre class="hex-box">${escapeHtml(data.hex_preview)}</pre>`;
-    }
-  } catch (error) {
-    resultEl.innerHTML = `<p class="error">Сетевая ошибка: ${escapeHtml(String(error))}</p>`;
+  if (!isClassFile) {
+    decompileBtn.style.display = 'none';
+  } else {
+    decompileBtn.style.display = 'inline-block';
+    setButtonColor(decompileBtn, 'gray');
+
+    decompileBtn.onclick = async () => {
+      if (!javaLoaded) {
+        decompileBtn.disabled = true;
+        decompileBtn.textContent = 'Декомпиляция...';
+
+        try {
+          const response = await fetch(`/decompile/${session}/${encodedPath}`);
+          const data = await response.json();
+
+          if (data.java_source) {
+            javaSource = data.java_source;
+            javaLoaded = true;
+            resultPanel.innerHTML = `<pre class="code-box">${escapeHtml(javaSource)}</pre>`;
+            decompileBtn.textContent = '📋 Копировать Java код';
+            setButtonColor(decompileBtn, 'green');
+            return;
+          }
+
+          const err = data.error || 'Не удалось декомпилировать';
+          resultPanel.innerHTML = `<p class="error">${escapeHtml(err)}</p>`;
+          if (data.hex_preview) {
+            resultPanel.innerHTML += `<pre class="hex-box">${escapeHtml(data.hex_preview)}</pre>`;
+          }
+          decompileBtn.textContent = 'Декомпилировать .class';
+          setButtonColor(decompileBtn, 'gray');
+        } catch (error) {
+          resultPanel.innerHTML = `<p class="error">Сетевая ошибка: ${escapeHtml(String(error))}</p>`;
+          decompileBtn.textContent = 'Декомпилировать .class';
+          setButtonColor(decompileBtn, 'gray');
+        } finally {
+          decompileBtn.disabled = false;
+        }
+        return;
+      }
+
+      try {
+        await copyToClipboard(javaSource);
+        const prev = decompileBtn.textContent;
+        decompileBtn.textContent = '✅ Скопировано!';
+        setTimeout(() => {
+          decompileBtn.textContent = prev || '📋 Копировать Java код';
+        }, 1500);
+      } catch (error) {
+        resultPanel.innerHTML = `<p class="error">Ошибка копирования: ${escapeHtml(String(error))}</p>`;
+      }
+    };
   }
-}
 
-function formatHex(uint8) {
-  let out = '';
-  for (let i = 0; i < uint8.length; i += 16) {
-    const chunk = Array.from(uint8.slice(i, i + 16));
-    const hex = chunk.map((b) => b.toString(16).padStart(2, '0')).join(' ');
-    const ascii = chunk.map((b) => (b >= 32 && b <= 126 ? String.fromCharCode(b) : '.')).join('');
-    out += `${i.toString(16).padStart(8, '0')}  ${hex.padEnd(47, ' ')}  ${ascii}\n`;
-  }
-  return out;
+  setButtonColor(hexBtn, 'gray');
+  hexBtn.onclick = async () => {
+    try {
+      if (hexState === 0) {
+        resultPanel.innerHTML = `<pre class="hex-box">${escapeHtml(hexData.pretty)}</pre>`;
+        hexBtn.textContent = '📋 Копировать HEX';
+        setButtonColor(hexBtn, 'orange');
+        hexState = 1;
+        return;
+      }
+
+      if (hexState === 1) {
+        await copyToClipboard(hexData.hexOnly);
+        messageEl.innerHTML = '<p>✅ HEX скопирован!</p>';
+        hexBtn.textContent = '📋 Копировать ASCII';
+        setButtonColor(hexBtn, 'blue');
+        hexState = 2;
+        setTimeout(() => {
+          messageEl.innerHTML = '';
+        }, 1500);
+        return;
+      }
+
+      await copyToClipboard(hexData.asciiOnly);
+      messageEl.innerHTML = '<p>✅ ASCII скопирован!</p>';
+      hexBtn.textContent = 'Показать HEX';
+      setButtonColor(hexBtn, 'gray');
+      hexState = 0;
+      setTimeout(() => {
+        messageEl.innerHTML = '';
+      }, 1500);
+    } catch (error) {
+      messageEl.innerHTML = `<p class="error">Ошибка копирования: ${escapeHtml(String(error))}</p>`;
+    }
+  };
 }
 
 function escapeHtml(value) {
