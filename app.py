@@ -7,6 +7,13 @@ from pathlib import Path
 
 from flask import Flask, jsonify, render_template, request, send_file
 
+from decompiler import (
+    DecompilerError,
+    DecompilerNotConfiguredError,
+    DecompilerTimeoutError,
+    decompile_class_bytes,
+)
+
 from parser import (
     ARTIFACT_STORE,
     analyze_archive,
@@ -96,6 +103,35 @@ def artifact(session_id: str, raw_path: str):
         as_attachment=False,
         download_name=os.path.basename(safe_path),
     )
+
+
+@app.get("/decompile/<session_id>/<path:raw_path>")
+def decompile_artifact(session_id: str, raw_path: str):
+    session = ARTIFACT_STORE.get(session_id)
+    if not session:
+        return jsonify({"error": "Сессия не найдена"}), 404
+
+    safe_path = sanitize_rel_path(raw_path)
+    if safe_path is None:
+        return jsonify({"error": "Недопустимый путь"}), 400
+
+    if not safe_path.lower().endswith(".class"):
+        return jsonify({"error": "Декомпиляция доступна только для .class файлов"}), 400
+
+    entry = session.get(safe_path)
+    if not entry:
+        return jsonify({"error": "Артефакт не найден"}), 404
+
+    try:
+        java_code = decompile_class_bytes(entry["data"], safe_path)
+    except DecompilerNotConfiguredError as exc:
+        return jsonify({"error": str(exc)}), 503
+    except DecompilerTimeoutError as exc:
+        return jsonify({"error": str(exc)}), 504
+    except DecompilerError as exc:
+        return jsonify({"error": str(exc)}), 422
+
+    return app.response_class(java_code, mimetype="text/plain; charset=utf-8")
 
 
 @app.get("/download/<session_id>/<path:raw_path>")
