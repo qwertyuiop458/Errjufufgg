@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import io
 import os
+import shutil
 import subprocess
 import tempfile
+import urllib.request
 import zipfile
 from pathlib import Path
 
@@ -26,6 +28,47 @@ from parser import (
 
 app = Flask(__name__)
 
+CFR_URL = "https://github.com/leibnitz27/cfr/releases/download/0.152/cfr-0.152.jar"
+CFR_PATH = Path(__file__).resolve().parent / "cfr.jar"
+
+
+def ensure_java_and_cfr() -> tuple[bool, str | None]:
+    java_ok = shutil.which("java") is not None
+    if java_ok:
+        java_check = subprocess.run(["java", "-version"], capture_output=True, text=True)
+        java_ok = java_check.returncode == 0
+
+    if not java_ok:
+        try:
+            subprocess.run(["apt-get", "update"], check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["apt-get", "install", "-y", "default-jdk"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            java_ok = shutil.which("java") is not None
+        except Exception as exc:  # noqa: BLE001
+            return False, f"Java не установлена и автоустановка не удалась: {exc}"
+
+    if not CFR_PATH.exists():
+        try:
+            urllib.request.urlretrieve(CFR_URL, CFR_PATH)
+        except Exception as exc:  # noqa: BLE001
+            return False, f"Не удалось скачать CFR: {exc}"
+
+    return True, None
+
+
+def build_hex_preview(data: bytes, limit: int = 256) -> str:
+    chunk = data[:limit]
+    lines: list[str] = []
+    for i in range(0, len(chunk), 16):
+        part = chunk[i : i + 16]
+        hex_values = " ".join(f"{b:02x}" for b in part)
+        ascii_values = "".join(chr(b) if 32 <= b <= 126 else "." for b in part)
+        lines.append(f"{i:08x}  {hex_values:<47}  {ascii_values}")
+    return "\n".join(lines)
 HEX_LINE_WIDTH = 16
 MAX_BINARY_CHUNK = 16 * 1024
 
@@ -88,22 +131,6 @@ def analyze():
         return jsonify({"error": "Файл JAR повреждён или не является ZIP архивом."}), 400
 
 
-@app.get("/artifact/<session_id>/<path:raw_path>")
-def artifact(session_id: str, raw_path: str):
-    safe_path, entry, error = get_artifact_entry(session_id, raw_path)
-    if error:
-        return error
-
-    return send_file(
-        io.BytesIO(entry["data"]),
-        mimetype=entry["mime"],
-        as_attachment=False,
-        download_name=os.path.basename(safe_path),
-    )
-
-
-
-
 @app.get("/decompile/<session_id>/<path:raw_path>")
 def decompile(session_id: str, raw_path: str):
     session = ARTIFACT_STORE.get(session_id)
@@ -111,8 +138,8 @@ def decompile(session_id: str, raw_path: str):
         return jsonify({"error": "Сессия не найдена"}), 404
 
     safe_path = sanitize_rel_path(raw_path)
-    if safe_path is None or not safe_path.lower().endswith('.class'):
-        return jsonify({"error": "Можно декомпилировать только .class файлы"}), 400
+    if safe_path is None:
+        return jsonify({"error": "Недопустимый путь"}), 400
 
     entry = session.get(safe_path)
     if not entry:
@@ -154,6 +181,10 @@ def download(session_id: str, raw_path: str):
     if not entry:
         return jsonify({"error": "Артефакт не найден"}), 404
 
+    return send_file(
+        io.BytesIO(entry["data"]),
+        mimetype=entry["mime"],
+        as_attachment=False,
     try:
         java_code = decompile_class_bytes(entry["data"], safe_path)
     except DecompilerNotConfiguredError as exc:

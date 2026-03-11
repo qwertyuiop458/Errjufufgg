@@ -6,16 +6,8 @@ const previewEl = document.getElementById('preview');
 const titleEl = document.getElementById('title');
 const metaEl = document.getElementById('meta');
 const searchEl = document.getElementById('search');
-const actionsEl = document.getElementById('actions');
-const btnDecompileEl = document.getElementById('btn-decompile');
-const btnBinaryEl = document.getElementById('btn-binary');
-const btnDownloadJavaEl = document.getElementById('btn-download-java');
-
-const BINARY_PAGE_SIZE = 4096;
 
 let currentData = null;
-let decompiledText = '';
-let binaryState = null;
 
 form.addEventListener('submit', async (event) => {
   event.preventDefault();
@@ -106,12 +98,53 @@ async function renderDefaultPreview(file, artifactUrl, downloadUrl) {
 
   if (file.mime.startsWith('audio/')) {
     previewEl.innerHTML = `<audio controls src="${artifactUrl}"></audio>`;
-    setMeta(file, downloadUrl, 'Text');
+    return;
+  }
+
+  if (file.path.toLowerCase().endsWith('.class')) {
+    previewEl.innerHTML = '<button id="decompile-btn" class="action-btn">Декомпилировать</button><div id="decompile-result"></div>';
+    document.getElementById('decompile-btn').onclick = () => decompileClass(session, encodedPath);
     return;
   }
 
   if (file.previewable) {
     const text = await fetch(artifactUrl).then((r) => r.text());
+    previewEl.innerHTML = `<pre class="code-box">${escapeHtml(text.slice(0, 20000))}</pre>`;
+    return;
+  }
+
+  const bin = await fetch(artifactUrl).then((r) => r.arrayBuffer());
+  const view = new Uint8Array(bin).slice(0, 256);
+  previewEl.innerHTML = `<pre class="hex-box">${formatHex(view)}</pre>`;
+}
+
+async function decompileClass(session, encodedPath) {
+  const resultEl = document.getElementById('decompile-result');
+  resultEl.innerHTML = '<p>Декомпиляция...</p>';
+
+  const response = await fetch(`/decompile/${session}/${encodedPath}`);
+  const data = await response.json();
+
+  if (data.java_source) {
+    resultEl.innerHTML = `<pre class="code-box">${escapeHtml(data.java_source)}</pre>`;
+    return;
+  }
+
+  resultEl.innerHTML = `<p class="error">${escapeHtml(data.error || 'Не удалось декомпилировать')}</p>`;
+  if (data.hex_preview) {
+    resultEl.innerHTML += `<pre class="hex-box">${escapeHtml(data.hex_preview)}</pre>`;
+  }
+}
+
+function formatHex(uint8) {
+  let out = '';
+  for (let i = 0; i < uint8.length; i += 16) {
+    const chunk = Array.from(uint8.slice(i, i + 16));
+    const hex = chunk.map((b) => b.toString(16).padStart(2, '0')).join(' ');
+    const ascii = chunk.map((b) => (b >= 32 && b <= 126 ? String.fromCharCode(b) : '.')).join('');
+    out += `${i.toString(16).padStart(8, '0')}  ${hex.padEnd(47, ' ')}  ${ascii}\n`;
+  }
+  return out;
     previewEl.innerHTML = `<pre>${escapeHtml(text.slice(0, 20000))}</pre>`;
     setMeta(file, downloadUrl, 'Text');
     return;
