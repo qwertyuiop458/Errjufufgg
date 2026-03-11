@@ -76,3 +76,22 @@ pre {
   padding: 0.8rem;
   border-radius: 8px;
 }
+
+#actions {
+  display: flex;
+  gap: 0.6rem;
+  margin-bottom: 0.8rem;
+  flex-wrap: wrap;
+}
+
+#actions.hidden {
+  display: none;
+}
+
+#actions button {
+  background: #2c3f7f;
+}
+
+#fallback-binary {
+  margin-top: 0.6rem;
+}
