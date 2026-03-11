@@ -5,6 +5,7 @@ import mimetypes
 import posixpath
 import zipfile
 from dataclasses import dataclass
+from uuid import uuid4
 
 
 ARTIFACT_STORE: dict[str, dict[str, dict[str, bytes | str]]] = {}
@@ -119,7 +120,7 @@ def analyze_archive(fileobj, display_name: str) -> dict:
             )
             artifacts[clean_name] = {"data": data, "mime": mime}
 
-    session_id = hashlib.sha1(f"{display_name}:{len(entries)}".encode()).hexdigest()[:16]
+    session_id = uuid4().hex[:16]
     ARTIFACT_STORE[session_id] = artifacts
 
     categories: dict[str, list[dict]] = {}
