@@ -190,3 +190,35 @@ pre {
 .audio-card input[type='range'] {
   vertical-align: middle;
 }
+
+
+.sig-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.sig-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin: 0.4rem 0;
+  padding: 0.4rem;
+  background: #121726;
+  border-radius: 6px;
+}
+
+.extract-btn {
+  padding: 0.4rem 0.6rem;
+  font-size: 0.8rem;
+}
+
+.audio-visual {
+  width: 100%;
+  height: 130px;
+  border: 1px solid #2a3150;
+  border-radius: 8px;
+  margin-top: 0.6rem;
+  background: #0f1322;
+}
