@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>J2ME Jar/Jad Explorer</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
+  </head>
+  <body>
+    <header>
+      <h1>J2ME Reverse Explorer</h1>
+      <p>Загрузи JAR/JAD и изучай внутренности игры: ресурсы, классы, музыку, текст и бинарные данные.</p>
+    </header>
+
+    <section class="upload-panel">
+      <form id="upload-form">
+        <label>
+          Основной файл (.jar или .jad)
+          <input type="file" name="file" accept=".jar,.jad" required />
+        </label>
+
+        <label>
+          Companion JAR (если выбран .jad)
+          <input type="file" name="jar_file" accept=".jar" />
+        </label>
+
+        <button type="submit">Разобрать архив</button>
+      </form>
+      <div id="status"></div>
+    </section>
+
+    <section class="workspace hidden" id="workspace">
+      <aside>
+        <input id="search" type="search" placeholder="Поиск по пути..." />
+        <div id="categories"></div>
+      </aside>
+      <main>
+        <section class="ai-panel">
+          <h3>🧠 AI Анализ</h3>
+          <div class="resolution-row">
+            <label>Разрешение экрана:</label>
+            <input id="res-width" type="number" min="1" value="240" />
+            <span>x</span>
+            <input id="res-height" type="number" min="1" value="320" />
+            <button id="apply-resolution" type="button">Применить к анализу</button>
+          </div>
+          <div id="resolution-report"></div>
+        </section>
+
+        <h2 id="title">Выберите файл</h2>
+        <div id="meta"></div>
+        <div id="preview"></div>
+      </main>
+    </section>
+
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+  </body>
+</html>
