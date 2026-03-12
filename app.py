@@ -2,11 +2,9 @@ from __future__ import annotations
 
 import io
 import os
-import re
 import shutil
 import subprocess
 import tempfile
-import threading
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -27,7 +25,111 @@ app = Flask(__name__)
 CFR_URL = "https://github.com/leibnitz27/cfr/releases/download/0.152/cfr-0.152.jar"
 CFR_PATH = Path(__file__).resolve().parent / "cfr.jar"
 JAVA_SETUP_STATE = {"checked": False, "ok": False, "error": None}
-ANALYSIS_LOCK = threading.Lock()
+FFMPEG_STATE = {"checked": False, "ok": False, "error": None}
+
+AUDIO_FORMAT_META = {
+    "midi": {"ext": "mid", "mime": "audio/midi"},
+    "wav": {"ext": "wav", "mime": "audio/wav"},
+    "mp3": {"ext": "mp3", "mime": "audio/mpeg"},
+    "amr": {"ext": "amr", "mime": "audio/amr"},
+    "ogg": {"ext": "ogg", "mime": "audio/ogg"},
+}
+
+
+def iter_session_files(session: dict) -> list[tuple[str, dict]]:
+    files: list[tuple[str, dict]] = []
+    for path, entry in session.items():
+        if isinstance(entry, dict) and "data" in entry and "mime" in entry:
+            files.append((path, entry))
+    return files
+
+
+def guess_auto_resolution(session: dict) -> dict[str, int] | None:
+    common = [(240, 320), (320, 240), (176, 208), (128, 160), (360, 640), (480, 800)]
+    files = iter_session_files(session)
+    scores = {r: 0 for r in common}
+    for _, entry in files:
+        data = entry.get("data")
+        if not isinstance(data, bytes):
+            continue
+        size = len(data)
+        for w, h in common:
+            if size == w * h:
+                scores[(w, h)] += 3
+            if size == (w // 16) * (h // 16):
+                scores[(w, h)] += 2
+            if size == (w // 8) * (h // 8):
+                scores[(w, h)] += 1
+
+    best = max(scores.items(), key=lambda x: x[1])
+    if best[1] <= 0:
+        return None
+    return {"width": best[0][0], "height": best[0][1], "source": "auto"}
+
+
+def analyze_tilemap(size: int, width: int, height: int) -> str:
+    if size == width * height:
+        return "Размер совпадает с width×height: вероятно 1 байт = 1 пиксель/тайл-карта"
+
+    tile_hyp = []
+    for tile in (8, 12, 16, 24, 32):
+        if width % tile == 0 and height % tile == 0:
+            tx = width // tile
+            ty = height // tile
+            if tx * ty == size:
+                tile_hyp.append(f"{tx}×{ty} тайлов по {tile}×{tile}")
+
+    if tile_hyp:
+        return "Похоже на tilemap: " + ", ".join(tile_hyp)
+
+    divisors = []
+    for d in range(2, min(size, 128)):
+        if size % d == 0:
+            divisors.append((d, size // d))
+    if divisors:
+        d0 = divisors[:5]
+        pairs = ", ".join(f"{a}×{b}" for a, b in d0)
+        return f"Точный match не найден, делители размера: {pairs}"
+    return "Tilemap-гипотеза не подтверждена"
+
+
+def build_resolution_report(session_id: str) -> dict:
+    session = ARTIFACT_STORE.get(session_id)
+    if not session:
+        return {"error": "Сессия не найдена"}
+
+    manual = session.get("manual_resolution") if isinstance(session.get("manual_resolution"), dict) else None
+    auto = guess_auto_resolution(session)
+
+    if manual:
+        width = int(manual.get("width", 0))
+        height = int(manual.get("height", 0))
+        source = "manual"
+    elif auto:
+        width = int(auto["width"])
+        height = int(auto["height"])
+        source = "auto"
+    else:
+        width, height, source = 0, 0, "unknown"
+
+    binary_rows = []
+    if width > 0 and height > 0:
+        for path, entry in iter_session_files(session):
+            data = entry.get("data")
+            if not isinstance(data, bytes):
+                continue
+            if path.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".mp3", ".wav", ".mid", ".midi", ".amr")):
+                continue
+            size = len(data)
+            note = analyze_tilemap(size, width, height)
+            if "вероятно" in note or "Похоже" in note or path.lower().startswith("m"):
+                binary_rows.append({"path": path, "size": size, "analysis": note})
+
+    return {
+        "resolution": {"width": width, "height": height, "source": source},
+        "binary_analysis": binary_rows[:30],
+        "files_checked": len(iter_session_files(session)),
+    }
 
 
 def ensure_java_and_cfr(force: bool = False) -> tuple[bool, str | None]:
@@ -224,166 +326,6 @@ def convert_audio_bytes_to_wav(data: bytes, input_ext: str) -> tuple[bytes | Non
         return None, str(exc)
 
 
-def _list_session_files(session: dict) -> list[tuple[str, dict]]:
-    return [(path, entry) for path, entry in session.items() if isinstance(entry, dict) and "data" in entry]
-
-
-def _extract_class_name(path: str, source: str) -> str:
-    match = re.search(r"\bclass\s+([A-Za-z_][A-Za-z0-9_]*)", source)
-    if match:
-        return match.group(1)
-    return Path(path).stem
-
-
-def _run_full_analysis(session_id: str) -> None:
-    session = ARTIFACT_STORE.get(session_id)
-    if not session:
-        return
-
-    analysis = session.get("full_analysis", {})
-    class_entries = [(p, e) for p, e in _list_session_files(session) if p.lower().endswith(".class")]
-    analysis.update({"status": "running", "message": "Подготовка к декомпиляции...", "total": len(class_entries), "done": 0})
-    session["full_analysis"] = analysis
-
-    ok, setup_error = ensure_java_and_cfr()
-    if not ok:
-        analysis.update({"status": "error", "message": setup_error or "Не удалось подготовить Java/CFR"})
-        return
-
-    decompiled: list[dict[str, str]] = []
-    all_sources: list[str] = []
-    for idx, (path, entry) in enumerate(class_entries, start=1):
-        analysis.update({"message": f"Анализ классов {idx}/{len(class_entries)}...", "done": idx - 1})
-        data = entry.get("data")
-        if not isinstance(data, bytes):
-            continue
-
-        try:
-            with tempfile.TemporaryDirectory() as tmp:
-                tmp_dir = Path(tmp)
-                class_path = tmp_dir / Path(path).name
-                class_path.write_bytes(data)
-                out_dir = tmp_dir / "out"
-                out_dir.mkdir(parents=True, exist_ok=True)
-                process = subprocess.run(
-                    ["java", "-jar", str(CFR_PATH), str(class_path), "--outputdir", str(out_dir)],
-                    capture_output=True,
-                    text=True,
-                    timeout=45,
-                )
-                java_files = list(out_dir.rglob("*.java"))
-                if process.returncode != 0 or not java_files:
-                    decompiled.append({"path": path, "error": (process.stderr or process.stdout or "decompile error").strip()})
-                    continue
-                source = java_files[0].read_text(encoding="utf-8", errors="ignore")
-                decompiled.append({"path": path, "source": source, "class_name": _extract_class_name(path, source)})
-                all_sources.append(source)
-        except Exception as exc:  # noqa: BLE001
-            decompiled.append({"path": path, "error": str(exc)})
-
-        analysis["done"] = idx
-
-    analysis["message"] = "Поиск ресурсов..."
-    text_blob = "\n".join(all_sources)
-    lower_blob = text_blob.lower()
-
-    main_classes = [item["class_name"] for item in decompiled if "source" in item and re.search(r"extends\s+MIDlet\b", item["source"])]
-    game_canvas_classes = [item["class_name"] for item in decompiled if "source" in item and re.search(r"extends\s+(GameCanvas|Canvas)\b", item["source"])]
-
-    def classes_by_keywords(words: tuple[str, ...]) -> list[str]:
-        return sorted({item["class_name"] for item in decompiled if "source" in item and any(w in item["class_name"].lower() for w in words)})
-
-    player_classes = classes_by_keywords(("player", "hero"))
-    enemy_classes = classes_by_keywords(("enemy", "monster"))
-    bullet_classes = classes_by_keywords(("bullet", "shot"))
-    item_classes = classes_by_keywords(("item", "bonus"))
-
-    game_type = "Unknown"
-    if re.search(r"tile\s*\[\s*\]\s*\[\s*\]", text_blob) or "loadmap(" in lower_blob:
-        game_type = "Platformer / Аркада"
-    elif "generatemaze(" in lower_blob:
-        game_type = "Лабиринт"
-    elif any(token in lower_blob for token in ["vehicle", "car", "turnleft", "turnright"]):
-        game_type = "Гонки"
-    elif "cell[][]" in lower_blob or "board" in lower_blob:
-        game_type = "Головоломка / Стратегия"
-
-    control = "Не определено"
-    if any(token in text_blob for token in ["KEY_NUM2", "KEY_NUM4", "KEY_NUM6", "KEY_NUM8"]):
-        control = "4 кнопки (2/4/6/8)"
-    elif "getGameAction" in text_blob:
-        control = "Джойстик"
-    elif "pointerPressed" in text_blob:
-        control = "Сенсор"
-
-    level_files = [p for p, _ in _list_session_files(session) if re.search(r"(^|/)(m\d{1,2}|level\d{1,2})(\.[^/]+)?$", p, re.IGNORECASE)]
-    sprite_files = [p for p, e in _list_session_files(session) if re.search(r"\.(png|jpg|jpeg)$", p, re.IGNORECASE) and isinstance(e.get("data"), bytes)]
-    music_files = [p for p, _ in _list_session_files(session) if re.search(r"\.(mid|midi|wav|mp3)$", p, re.IGNORECASE)]
-    font_files = [p for p, _ in _list_session_files(session) if re.search(r"\.(fnt|png)$", p, re.IGNORECASE) and "font" in p.lower()]
-
-    binary_notes: list[dict[str, str]] = []
-    for p, e in _list_session_files(session):
-        if re.search(r"(^|/)(m\d+|data)(\.[^/]+)?$", p, re.IGNORECASE):
-            payload = e.get("data")
-            if isinstance(payload, bytes):
-                hex_line = " ".join(f"{b:02x}" for b in payload[:32])
-                guess = "Сырые бинарные данные"
-                if len(payload) % (20 * 15) == 0:
-                    guess = "Похоже на tilemap 20x15 (1 байт = tile ID)"
-                binary_notes.append({"file": p, "guess": guess, "first_32": hex_line})
-
-    methods = {
-        "paint(Graphics g)": bool(re.search(r"\bpaint\s*\(\s*Graphics", text_blob)),
-        "keyPressed/keyReleased": bool(re.search(r"\bkeyPressed\s*\(|\bkeyReleased\s*\(", text_blob)),
-        "run()/gameLoop()": bool(re.search(r"\brun\s*\(|\bgameLoop\s*\(", text_blob)),
-        "loadLevel()/init()": bool(re.search(r"\bloadLevel\s*\(|\binit\s*\(", text_blob)),
-    }
-
-    class_names = [item["class_name"] for item in decompiled if "class_name" in item]
-    graph_nodes = [{"id": name, "label": name} for name in sorted(set(class_names))]
-    edges: set[tuple[str, str]] = set()
-    for item in decompiled:
-        if "source" not in item:
-            continue
-        src = item["class_name"]
-        for dst in class_names:
-            if dst == src:
-                continue
-            if re.search(rf"\b{re.escape(dst)}\b", item["source"]):
-                edges.add((src, dst))
-    graph_edges = [{"from": a, "to": b} for a, b in sorted(edges)]
-
-    pseudocode = """while (running) {
-    updatePlayer();
-    updateEnemies();
-    checkCollisions();
-    repaint();
-    sleep(30ms);
-}"""
-
-    report = {
-        "game_type": game_type,
-        "resolution": "Не определено",
-        "control": control,
-        "levels_found": len(level_files),
-        "player_classes": player_classes,
-        "enemy_classes": enemy_classes,
-        "bullet_classes": bullet_classes,
-        "item_classes": item_classes,
-        "main_midlet_classes": main_classes,
-        "game_canvas_classes": game_canvas_classes,
-        "method_presence": methods,
-        "resources": {"sprites": sprite_files, "music": music_files, "fonts": font_files},
-        "level_files": level_files,
-        "binary_notes": binary_notes,
-        "graph": {"nodes": graph_nodes, "edges": graph_edges},
-        "pseudocode": pseudocode,
-        "decompiled_sources": [item for item in decompiled if "source" in item],
-    }
-
-    analysis.update({"status": "done", "message": "Анализ завершён", "done": len(class_entries), "result": report})
-
-
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -440,6 +382,32 @@ def analyze():
         return jsonify(analyze_archive(io.BytesIO(jar_bytes), display_name=filename))
     except zipfile.BadZipFile:
         return jsonify({"error": "Файл JAR повреждён или не является ZIP архивом."}), 400
+
+
+@app.post("/set_resolution/<session_id>")
+def set_resolution(session_id: str):
+    session = ARTIFACT_STORE.get(session_id)
+    if not session:
+        return jsonify({"error": "Сессия не найдена"}), 404
+
+    payload = request.get_json(silent=True) or {}
+    width = int(payload.get("width", 0))
+    height = int(payload.get("height", 0))
+
+    if width <= 0 or height <= 0:
+        return jsonify({"error": "width и height должны быть > 0"}), 400
+
+    session["manual_resolution"] = {"width": width, "height": height}
+    report = build_resolution_report(session_id)
+    return jsonify({"ok": True, "manual_resolution": session["manual_resolution"], "report": report})
+
+
+@app.get("/resolution_report/<session_id>")
+def resolution_report(session_id: str):
+    report = build_resolution_report(session_id)
+    if "error" in report:
+        return jsonify(report), 404
+    return jsonify(report)
 
 
 @app.get("/audio_scan/<session_id>/<path:raw_path>")
@@ -678,91 +646,6 @@ def decompile(session_id: str, raw_path: str):
             return jsonify({"java_source": java_source, "hex_preview": None, "error": None}), 200
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": f"Ошибка декомпиляции: {exc}", "hex_preview": build_hex_preview(data)}), 200
-
-
-@app.post("/full_analysis/start/<session_id>")
-def full_analysis_start(session_id: str):
-    session = ARTIFACT_STORE.get(session_id)
-    if not session:
-        return jsonify({"error": "Сессия не найдена"}), 404
-
-    with ANALYSIS_LOCK:
-        current = session.get("full_analysis")
-        if isinstance(current, dict) and current.get("status") == "running":
-            return jsonify({"ok": True, "already_running": True})
-        session["full_analysis"] = {"status": "running", "message": "Запуск...", "done": 0, "total": 0}
-        threading.Thread(target=_run_full_analysis, args=(session_id,), daemon=True).start()
-    return jsonify({"ok": True, "already_running": False})
-
-
-@app.get("/full_analysis/status/<session_id>")
-def full_analysis_status(session_id: str):
-    session = ARTIFACT_STORE.get(session_id)
-    if not session:
-        return jsonify({"error": "Сессия не найдена"}), 404
-    data = session.get("full_analysis")
-    if not isinstance(data, dict):
-        return jsonify({"status": "idle", "message": "Анализ не запускался", "done": 0, "total": 0})
-    return jsonify({
-        "status": data.get("status", "idle"),
-        "message": data.get("message", ""),
-        "done": data.get("done", 0),
-        "total": data.get("total", 0),
-    })
-
-
-@app.get("/full_analysis/result/<session_id>")
-def full_analysis_result(session_id: str):
-    session = ARTIFACT_STORE.get(session_id)
-    if not session:
-        return jsonify({"error": "Сессия не найдена"}), 404
-    data = session.get("full_analysis")
-    if not isinstance(data, dict) or data.get("status") != "done":
-        return jsonify({"error": "Анализ ещё не завершён"}), 400
-    return jsonify(data.get("result", {}))
-
-
-@app.get("/full_analysis/export/<session_id>")
-def full_analysis_export(session_id: str):
-    session = ARTIFACT_STORE.get(session_id)
-    if not session:
-        return jsonify({"error": "Сессия не найдена"}), 404
-    data = session.get("full_analysis")
-    if not isinstance(data, dict) or data.get("status") != "done":
-        return jsonify({"error": "Анализ ещё не завершён"}), 400
-
-    report = data.get("result", {})
-    blob = io.BytesIO()
-    with zipfile.ZipFile(blob, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for item in report.get("decompiled_sources", []):
-            path = item.get("path", "Unknown.class")
-            java_path = f"src/{Path(path).with_suffix('.java').as_posix()}"
-            zf.writestr(java_path, item.get("source", ""))
-
-        for path, entry in _list_session_files(session):
-            payload = entry.get("data")
-            if not isinstance(payload, bytes):
-                continue
-            lower = path.lower()
-            if re.search(r"(^|/)(m\d+|level\d+|data)(\.[^/]+)?$", lower):
-                zf.writestr(f"res/levels/{Path(path).name}", payload)
-            elif lower.endswith((".png", ".jpg", ".jpeg", ".gif", ".bmp", ".wbmp")):
-                zf.writestr(f"res/gfx/{Path(path).name}", payload)
-            elif lower.endswith((".mid", ".midi", ".wav", ".mp3", ".amr")):
-                zf.writestr(f"res/snd/{Path(path).name}", payload)
-
-        analysis_text = [
-            f"Тип игры: {report.get('game_type', 'Unknown')}",
-            f"Управление: {report.get('control', 'Не определено')}",
-            f"Уровней найдено: {report.get('levels_found', 0)}",
-            f"Классы игрока: {', '.join(report.get('player_classes', [])) or '-'}",
-            f"Классы врагов: {', '.join(report.get('enemy_classes', [])) or '-'}",
-        ]
-        zf.writestr("docs/analysis.txt", "\n".join(analysis_text))
-        zf.writestr("docs/pseudocode.txt", report.get("pseudocode", ""))
-
-    blob.seek(0)
-    return send_file(blob, mimetype="application/zip", as_attachment=True, download_name="reconstructed_project.zip")
 
 
 @app.get("/artifact/<session_id>/<path:raw_path>")

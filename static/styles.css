@@ -222,3 +222,33 @@ pre {
   margin-top: 0.6rem;
   background: #0f1322;
 }
+
+
+.ai-panel {
+  margin-bottom: 1rem;
+  background: #141a2a;
+  border: 1px solid #2b3556;
+  border-radius: 10px;
+  padding: 0.8rem;
+}
+
+.resolution-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+
+.resolution-row input[type='number'] {
+  width: 90px;
+  padding: 0.35rem;
+  border-radius: 6px;
+  border: 1px solid #3a466d;
+  background: #0f1322;
+  color: #fff;
+}
+
+#resolution-report {
+  margin-top: 0.6rem;
+  font-size: 0.92rem;
+}

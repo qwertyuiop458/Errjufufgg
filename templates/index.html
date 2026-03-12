@@ -35,6 +35,18 @@
         <div id="categories"></div>
       </aside>
       <main>
+        <section class="ai-panel">
+          <h3>🧠 AI Анализ</h3>
+          <div class="resolution-row">
+            <label>Разрешение экрана:</label>
+            <input id="res-width" type="number" min="1" value="240" />
+            <span>x</span>
+            <input id="res-height" type="number" min="1" value="320" />
+            <button id="apply-resolution" type="button">Применить к анализу</button>
+          </div>
+          <div id="resolution-report"></div>
+        </section>
+
         <h2 id="title">Выберите файл</h2>
         <div id="meta"></div>
         <div id="preview"></div>
