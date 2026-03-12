@@ -74,6 +74,45 @@ def ensure_java_and_cfr(force: bool = False) -> tuple[bool, str | None]:
     return True, None
 
 
+def ensure_ffmpeg(force: bool = False) -> tuple[bool, str | None]:
+    if FFMPEG_STATE["checked"] and not force:
+        return bool(FFMPEG_STATE["ok"]), FFMPEG_STATE["error"]
+
+    ffmpeg_ok = shutil.which("ffmpeg") is not None
+    if not ffmpeg_ok:
+        try:
+            subprocess.run(["apt-get", "update"], check=True, capture_output=True, text=True, timeout=120)
+            subprocess.run(
+                ["apt-get", "install", "-y", "ffmpeg"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=240,
+            )
+            ffmpeg_ok = shutil.which("ffmpeg") is not None
+        except Exception as exc:  # noqa: BLE001
+            FFMPEG_STATE.update(
+                {
+                    "checked": True,
+                    "ok": False,
+                    "error": f"FFmpeg не установлен и автоустановка не удалась: {exc}",
+                }
+            )
+            return False, str(FFMPEG_STATE["error"])
+
+    FFMPEG_STATE.update({"checked": True, "ok": ffmpeg_ok, "error": None if ffmpeg_ok else "FFmpeg не найден"})
+    return bool(FFMPEG_STATE["ok"]), FFMPEG_STATE["error"]
+
+
+def build_hex_preview(data: bytes, limit: int = 256) -> str:
+    chunk = data[:limit]
+    lines: list[str] = []
+    for i in range(0, len(chunk), 16):
+        part = chunk[i : i + 16]
+        hex_values = " ".join(f"{b:02x}" for b in part)
+        ascii_values = "".join(chr(b) if 32 <= b <= 126 else "." for b in part)
+        lines.append(f"{i:08x}  {hex_values:<47}  {ascii_values}")
+    return "\n".join(lines)
 
 
 def estimate_duration_seconds(data: bytes, fmt: str, offset: int = 0) -> float | None:
@@ -91,15 +130,98 @@ def estimate_duration_seconds(data: bytes, fmt: str, offset: int = 0) -> float |
         return None
     return round(data_size / byte_rate, 2)
 
-def build_hex_preview(data: bytes, limit: int = 256) -> str:
-    chunk = data[:limit]
-    lines: list[str] = []
-    for i in range(0, len(chunk), 16):
-        part = chunk[i : i + 16]
-        hex_values = " ".join(f"{b:02x}" for b in part)
-        ascii_values = "".join(chr(b) if 32 <= b <= 126 else "." for b in part)
-        lines.append(f"{i:08x}  {hex_values:<47}  {ascii_values}")
-    return "\n".join(lines)
+
+def scan_audio_signatures(data: bytes, scan_limit: int = 1024) -> list[dict[str, int | str]]:
+    chunk = data[:scan_limit]
+    found: list[dict[str, int | str]] = []
+
+    def push(fmt: str, offset: int, sig: str):
+        found.append(
+            {
+                "format": fmt,
+                "offset": offset,
+                "offset_hex": f"0x{offset:08x}",
+                "signature": sig,
+                "mime": AUDIO_FORMAT_META[fmt]["mime"],
+                "extension": AUDIO_FORMAT_META[fmt]["ext"],
+            }
+        )
+
+    start = 0
+    while True:
+        pos = chunk.find(b"MThd", start)
+        if pos < 0:
+            break
+        push("midi", pos, "MThd")
+        start = pos + 1
+
+    start = 0
+    while True:
+        pos = chunk.find(b"RIFF", start)
+        if pos < 0:
+            break
+        if pos + 12 <= len(chunk) and chunk[pos + 8 : pos + 12] == b"WAVE":
+            push("wav", pos, "RIFF...WAVE")
+        start = pos + 1
+
+    start = 0
+    while True:
+        pos = chunk.find(b"ID3", start)
+        if pos < 0:
+            break
+        push("mp3", pos, "ID3")
+        start = pos + 1
+
+    for i in range(max(0, len(chunk) - 1)):
+        if chunk[i] == 0xFF and i + 1 < len(chunk) and chunk[i + 1] in (0xFB, 0xF3):
+            push("mp3", i, "FF FB/F3")
+
+    start = 0
+    while True:
+        pos = chunk.find(b"#!AMR", start)
+        if pos < 0:
+            break
+        push("amr", pos, "#!AMR")
+        start = pos + 1
+
+    start = 0
+    while True:
+        pos = chunk.find(b"OggS", start)
+        if pos < 0:
+            break
+        push("ogg", pos, "OggS")
+        start = pos + 1
+
+    uniq: dict[tuple[str, int], dict[str, int | str]] = {}
+    for row in found:
+        uniq[(str(row["format"]), int(row["offset"]))] = row
+
+    return sorted(uniq.values(), key=lambda x: int(x["offset"]))
+
+
+def convert_audio_bytes_to_wav(data: bytes, input_ext: str) -> tuple[bytes | None, str | None]:
+    ok, err = ensure_ffmpeg()
+    if not ok:
+        return None, err
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            src = tmp_dir / f"source.{input_ext}"
+            dst = tmp_dir / "out.wav"
+            src.write_bytes(data)
+
+            proc = subprocess.run(
+                ["ffmpeg", "-y", "-i", str(src), str(dst)],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            if proc.returncode != 0 or not dst.exists():
+                return None, (proc.stderr or proc.stdout or "ffmpeg conversion failed")
+            return dst.read_bytes(), None
+    except Exception as exc:  # noqa: BLE001
+        return None, str(exc)
 
 
 def _list_session_files(session: dict) -> list[tuple[str, dict]]:
@@ -320,6 +442,26 @@ def analyze():
         return jsonify({"error": "Файл JAR повреждён или не является ZIP архивом."}), 400
 
 
+@app.get("/audio_scan/<session_id>/<path:raw_path>")
+def audio_scan(session_id: str, raw_path: str):
+    session = ARTIFACT_STORE.get(session_id)
+    if not session:
+        return jsonify({"error": "Сессия не найдена"}), 404
+
+    safe_path = sanitize_rel_path(raw_path)
+    if safe_path is None:
+        return jsonify({"error": "Недопустимый путь"}), 400
+
+    entry = session.get(safe_path)
+    if not entry:
+        return jsonify({"error": "Артефакт не найден"}), 404
+
+    data = entry["data"]
+    if not isinstance(data, bytes):
+        return jsonify({"error": "Некорректные данные артефакта"}), 500
+
+    signatures = scan_audio_signatures(data)
+    return jsonify({"found": bool(signatures), "signatures": signatures, "scan_bytes": min(1024, len(data))})
 
 
 @app.get("/audio_probe/<session_id>/<path:raw_path>")
@@ -360,6 +502,83 @@ def audio_probe(session_id: str, raw_path: str):
     )
 
 
+@app.get("/audio_extract/<session_id>/<path:raw_path>")
+def audio_extract(session_id: str, raw_path: str):
+    session = ARTIFACT_STORE.get(session_id)
+    if not session:
+        return jsonify({"error": "Сессия не найдена"}), 404
+
+    safe_path = sanitize_rel_path(raw_path)
+    if safe_path is None:
+        return jsonify({"error": "Недопустимый путь"}), 400
+
+    entry = session.get(safe_path)
+    if not entry:
+        return jsonify({"error": "Артефакт не найден"}), 404
+
+    data = entry["data"]
+    if not isinstance(data, bytes):
+        return jsonify({"error": "Некорректные данные артефакта"}), 500
+
+    signatures = scan_audio_signatures(data)
+    if not signatures:
+        return jsonify({"error": "Аудиосигнатуры не найдены"}), 400
+
+    offset = int(request.args.get("offset", signatures[0]["offset"]))
+    signature_offsets = [int(s["offset"]) for s in signatures]
+    if offset not in signature_offsets:
+        return jsonify({"error": "Запрошенный offset не соответствует найденным сигнатурам"}), 400
+
+    idx = signature_offsets.index(offset)
+    end_offset = signature_offsets[idx + 1] if idx + 1 < len(signature_offsets) else len(data)
+    fmt = str(signatures[idx]["format"])
+    extracted = data[offset:end_offset]
+
+    mode = request.args.get("mode", "stream")
+    convert = request.args.get("convert", "0") in {"1", "true", "yes"}
+
+    out_data = extracted
+    out_fmt = fmt
+    out_mime = AUDIO_FORMAT_META[fmt]["mime"]
+    out_ext = AUDIO_FORMAT_META[fmt]["ext"]
+
+    if convert or fmt == "amr":
+        converted, err = convert_audio_bytes_to_wav(extracted, out_ext)
+        if converted is None:
+            if mode == "json":
+                return jsonify({"error": f"Конвертация не удалась: {err}"}), 200
+        else:
+            out_data = converted
+            out_fmt = "wav"
+            out_mime = "audio/wav"
+            out_ext = "wav"
+
+    if mode == "json":
+        return jsonify(
+            {
+                "ok": True,
+                "format": out_fmt,
+                "mime": out_mime,
+                "offset": offset,
+                "end_offset": end_offset,
+                "size": len(out_data),
+                "stream_url": f"/audio_extract/{session_id}/{safe_path}?offset={offset}&convert={int(convert)}",
+                "save_url": f"/audio_extract/{session_id}/{safe_path}?offset={offset}&convert={int(convert)}&download=1",
+            }
+        )
+
+    download = request.args.get("download", "0") in {"1", "true", "yes"}
+    base_name = Path(safe_path).stem
+    file_name = f"{base_name}_{offset:08x}.{out_ext}"
+
+    return send_file(
+        io.BytesIO(out_data),
+        mimetype=out_mime,
+        as_attachment=download,
+        download_name=file_name,
+    )
+
+
 @app.get("/audio_stream/<session_id>/<path:raw_path>")
 def audio_stream(session_id: str, raw_path: str):
     session = ARTIFACT_STORE.get(session_id)
@@ -387,12 +606,20 @@ def audio_stream(session_id: str, raw_path: str):
         return jsonify({"error": "Недопустимый offset"}), 400
 
     mime = str(probe["mime"])
+    ext = "bin"
+    for fmt, meta in AUDIO_FORMAT_META.items():
+        if meta["mime"] == mime:
+            ext = meta["ext"]
+            break
+    file_name = f"{Path(safe_path).stem}.{ext}"
+
     return send_file(
         io.BytesIO(data[offset:]),
         mimetype=mime,
         as_attachment=False,
-        download_name=os.path.basename(safe_path),
+        download_name=file_name,
     )
+
 
 @app.get("/decompile/<session_id>/<path:raw_path>")
 def decompile(session_id: str, raw_path: str):
@@ -574,11 +801,19 @@ def download(session_id: str, raw_path: str):
     if not entry:
         return jsonify({"error": "Артефакт не найден"}), 404
 
+    ext = Path(safe_path).suffix
+    name = os.path.basename(safe_path)
+    if not ext:
+        probe = detect_audio_signature(entry["data"], safe_path) if isinstance(entry["data"], bytes) else None
+        if probe:
+            fmt = str(probe["format"])
+            name = f"{name}.{AUDIO_FORMAT_META.get(fmt, {'ext': 'bin'})['ext']}"
+
     return send_file(
         io.BytesIO(entry["data"]),
         mimetype="application/octet-stream",
         as_attachment=True,
-        download_name=os.path.basename(safe_path),
+        download_name=name,
     )
 
 

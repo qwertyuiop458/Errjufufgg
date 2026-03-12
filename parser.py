@@ -40,6 +40,7 @@ AUDIO_MIME = {
     "wav": "audio/wav",
     "mp3": "audio/mpeg",
     "amr": "audio/amr",
+    "ogg": "audio/ogg",
 }
 
 
@@ -95,6 +96,7 @@ def detect_audio_signature(data: bytes, path: str = "", scan_limit: int = 1024) 
         ".wav": "wav",
         ".mp3": "mp3",
         ".amr": "amr",
+        ".ogg": "ogg",
     }
     for ext, fmt in ext_map.items():
         if path_lower.endswith(ext):
@@ -123,6 +125,10 @@ def detect_audio_signature(data: bytes, path: str = "", scan_limit: int = 1024) 
     amr_pos = chunk.find(b"#!AMR")
     if amr_pos >= 0:
         return {"format": "amr", "offset": amr_pos, "mime": AUDIO_MIME["amr"]}
+
+    ogg_pos = chunk.find(b"OggS")
+    if ogg_pos >= 0:
+        return {"format": "ogg", "offset": ogg_pos, "mime": AUDIO_MIME["ogg"]}
 
     return None
 
