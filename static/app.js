@@ -8,6 +8,7 @@ const metaEl = document.getElementById('meta');
 const searchEl = document.getElementById('search');
 
 let currentData = null;
+let analysisPollTimer = null;
 
 form.addEventListener('submit', async (event) => {
   event.preventDefault();
@@ -30,6 +31,7 @@ form.addEventListener('submit', async (event) => {
     statusEl.textContent = `Готово: ${data.archive_name}, файлов: ${data.file_count}`;
     workspace.classList.remove('hidden');
     renderCategories();
+    renderFullAnalysisEntry();
   } catch (error) {
     statusEl.textContent = `Ошибка сети: ${error}`;
   }
@@ -637,6 +639,135 @@ async function selectFile(file, itemNode) {
       messageEl.innerHTML = `<p>Найден ${escapeHtml(probeResp.format.toUpperCase())} @ ${probeResp.offset_hex}</p>`;
     };
   }
+}
+
+
+function renderFullAnalysisEntry() {
+  if (!currentData || !currentData.session_id) return;
+
+  const wrapper = document.createElement('details');
+  wrapper.className = 'category';
+  wrapper.open = true;
+
+  wrapper.innerHTML = `
+    <summary>🔬 Полная декомпиляция проекта</summary>
+    <div style="padding:10px 12px;display:grid;gap:8px;">
+      <button type="button" id="full-analysis-btn" class="action-btn">Полностью разобрать игру</button>
+      <div id="full-analysis-progress">Ожидание запуска...</div>
+      <progress id="full-analysis-bar" value="0" max="1" style="width:100%;"></progress>
+    </div>
+  `;
+
+  categoriesEl.prepend(wrapper);
+
+  const startBtn = wrapper.querySelector('#full-analysis-btn');
+  const progressEl = wrapper.querySelector('#full-analysis-progress');
+  const barEl = wrapper.querySelector('#full-analysis-bar');
+
+  startBtn.onclick = async () => {
+    try {
+      startBtn.disabled = true;
+      progressEl.textContent = 'Запуск фонового анализа...';
+      await fetch(`/full_analysis/start/${currentData.session_id}`, { method: 'POST' });
+      if (analysisPollTimer) clearInterval(analysisPollTimer);
+      analysisPollTimer = setInterval(() => pollFullAnalysis(progressEl, barEl, startBtn), 1200);
+      await pollFullAnalysis(progressEl, barEl, startBtn);
+    } catch (error) {
+      progressEl.textContent = `Ошибка запуска: ${error}`;
+      startBtn.disabled = false;
+    }
+  };
+}
+
+async function pollFullAnalysis(progressEl, barEl, startBtn) {
+  const response = await fetch(`/full_analysis/status/${currentData.session_id}`);
+  const data = await response.json();
+  const done = Number(data.done || 0);
+  const total = Number(data.total || 0);
+
+  barEl.max = Math.max(total, 1);
+  barEl.value = Math.min(done, barEl.max);
+  progressEl.textContent = data.message || 'Анализ выполняется...';
+
+  if (data.status === 'done') {
+    if (analysisPollTimer) clearInterval(analysisPollTimer);
+    analysisPollTimer = null;
+    startBtn.disabled = false;
+    startBtn.textContent = 'Перезапустить анализ';
+    await renderAIAnalysisTab();
+  }
+
+  if (data.status === 'error') {
+    if (analysisPollTimer) clearInterval(analysisPollTimer);
+    analysisPollTimer = null;
+    startBtn.disabled = false;
+    progressEl.textContent = `Ошибка: ${data.message || 'анализ прерван'}`;
+  }
+}
+
+async function renderAIAnalysisTab() {
+  const response = await fetch(`/full_analysis/result/${currentData.session_id}`);
+  const data = await response.json();
+  if (data.error) return;
+
+  titleEl.textContent = '🧠 AI Анализ';
+  metaEl.innerHTML = `
+    <div class="meta-grid">
+      <span>Тип игры:</span><strong>${escapeHtml(data.game_type || 'Unknown')}</strong>
+      <span>Разрешение:</span><strong>${escapeHtml(data.resolution || 'Не определено')}</strong>
+      <span>Управление:</span><strong>${escapeHtml(data.control || 'Не определено')}</strong>
+      <span>Уровней найдено:</span><strong>${Number(data.levels_found || 0)}</strong>
+      <span>Классов игрока:</span><strong>${escapeHtml((data.player_classes || []).join(', ') || '-')}</strong>
+      <span>Классов врагов:</span><strong>${escapeHtml((data.enemy_classes || []).join(', ') || '-')}</strong>
+    </div>
+    <a class="download-link" href="/full_analysis/export/${currentData.session_id}">📦 Скачать как проект</a>
+  `;
+
+  previewEl.innerHTML = `
+    <section>
+      <h3>Псевдокод игрового цикла</h3>
+      <pre class="code-box">${escapeHtml(data.pseudocode || '')}</pre>
+    </section>
+    <section>
+      <h3>Методы и структура</h3>
+      <pre class="code-box">${escapeHtml(JSON.stringify(data.method_presence || {}, null, 2))}</pre>
+    </section>
+    <section>
+      <h3>Бинарные форматы (первые 32 байта)</h3>
+      <pre class="code-box">${escapeHtml(JSON.stringify(data.binary_notes || [], null, 2))}</pre>
+    </section>
+    <section>
+      <h3>Граф связей</h3>
+      <div id="analysis-graph" style="height:380px;border:1px solid #2f3547;border-radius:8px;"></div>
+    </section>
+  `;
+
+  await ensureVisJs();
+  drawGraph(data.graph || { nodes: [], edges: [] });
+}
+
+async function ensureVisJs() {
+  if (window.vis && window.vis.Network) return;
+  await new Promise((resolve, reject) => {
+    const script = document.createElement('script');
+    script.src = 'https://unpkg.com/vis-network@9.1.9/dist/vis-network.min.js';
+    script.onload = resolve;
+    script.onerror = reject;
+    document.head.appendChild(script);
+  });
+}
+
+function drawGraph(graph) {
+  const host = document.getElementById('analysis-graph');
+  if (!host || !window.vis) return;
+  const nodes = new vis.DataSet(graph.nodes || []);
+  const edges = new vis.DataSet(graph.edges || []);
+  new vis.Network(host, { nodes, edges }, {
+    physics: { stabilization: true },
+    layout: { improvedLayout: true },
+    nodes: { shape: 'dot', size: 14, font: { color: '#fff' } },
+    edges: { color: '#7ea1ff', arrows: { to: false } },
+  });
 }
 
 function escapeHtml(value) {
